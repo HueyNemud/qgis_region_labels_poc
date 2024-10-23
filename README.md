@@ -1,0 +1,3 @@
+# PoC PyQGIS script to crop and export regions with labels OOBs
+
+...
