@@ -48,10 +48,8 @@ from qgis.core import (
     QgsField,
     QgsFeature,
     QgsMapSettings,
-    edit,
     QgsMessageLog,
-    QgsGeometry,
-    QgsPointXY,
+    Qgis,
 )
 from qgis.utils import iface
 import processing  # type: ignore -> automatically imported by QGIS, but prevent "undefined name" errors in the IDE.
@@ -241,6 +239,28 @@ def create_label_layer(labels: list[QgsLabelPosition], region: QgsRectangle):
             features.append(feature)
 
         char_id += 1
+
+    # If there are no labels, create an empty layer and return it
+    if not features:
+        m = f"No labels in {region.asWktPolygon()}"
+        QgsMessageLog.logMessage(m, "LabelExtractor", Qgis.Warning)
+        print(m)
+
+        # For next steps to behave consistently, we create and return an new, empty layer
+        # with the same fields as the output of this function
+        dummy = QgsVectorLayer("Polygon?crs=epsg:2154", "labels_oobs", "memory")
+        dummy.dataProvider().addAttributes(
+            [
+                QgsField("id", QVariant.Int),
+                QgsField("geometry", QVariant.Polygon),
+                QgsField("texte", QVariant.String),
+                QgsField("texte_complet", QVariant.String),
+                QgsField("nature", QVariant.String),
+            ]
+        )
+        dummy.updateFields()
+        print(f"Created dummy layer for {region.asWktPolygon()}")
+        return dummy
 
     provider.addFeatures(features)
 
