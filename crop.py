@@ -174,33 +174,13 @@ class RegionExtractor:
             )
             labels_imspace = labels_imspace["OUTPUT"]
 
-            # Add the 4 corners of the bounding box as WKT POINTs, each in a separate column
-            # Add the columns to the layer
-            labels_imspace.dataProvider().addAttributes(
-                [
-                    QgsField("x1_y1", QVariant.String),
-                    QgsField("x2_y2", QVariant.String),
-                    QgsField("x3_y3", QVariant.String),
-                    QgsField("x4_y4", QVariant.String),
-                ]
-            )
-            labels_imspace.updateFields()
-
-            # Do do so iterate over the features and add the 4 points as WKT POINTs
-            with edit(labels_imspace):
-                for feature in labels_imspace.getFeatures():
-                    geom = feature.geometry()
-                    points = geom.asPolygon()[0]
-                    for i, point in enumerate(points[:4]):
-                        feature[f"x{i+1}_y{i+1}"] = f"POINT({point.x()} {point.y()})"
-                    labels_imspace.updateFeature(feature)
-
             # Save the layer to a CSV file using processing
             processing.run(
                 "native:savefeatures",
                 {
                     "INPUT": labels_imspace,
                     "OUTPUT": force_format(output_file, format),
+                    "LAYER_OPTIONS": "GEOMETRY=AS_WKT",
                 },
             )
 
