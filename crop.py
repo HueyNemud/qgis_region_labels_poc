@@ -181,6 +181,7 @@ def create_label_layer(labels: list[QgsLabelPosition]):
         if label.labelText[char_id] in WORD_SEPARATORS:
             group_id += 1
         else:
+            is_curved = label.groupedLabelId != 0  # Non zero if in a curved label.
             oob = label.labelGeometry
             feature = QgsFeature()
             feature.setGeometry(oob)
@@ -190,7 +191,7 @@ def create_label_layer(labels: list[QgsLabelPosition]):
                     group_id,
                     char_id,
                     f"{label.featureId}-{group_id}",
-                    label.labelText[char_id],
+                    label.labelText[char_id] if is_curved else label.labelText,
                     label.labelText,
                 ]
             )
