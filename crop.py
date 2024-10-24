@@ -49,14 +49,24 @@ from qgis.core import (
     QgsFeature,
     QgsMapSettings,
     edit,
+    QgsMessageLog,
+    QgsGeometry,
+    QgsPointXY,
 )
 from qgis.utils import iface
 import processing  # type: ignore -> automatically imported by QGIS, but prevent "undefined name" errors in the IDE.
 from PyQt5.QtCore import QVariant, QSize
 from timeit import default_timer as timer
+from functools import lru_cache
 
 # All blank spaces and breaks are considered word separators.
 WORD_SEPARATORS = [" ", "\t", "\n", "\r", "\f", "\v"]
+
+# Should we cut the OOBs to the extent of the region?
+CLIP_OOB_TO_REGION = True
+
+# In DEBUG mode, the OOBs layer is kept in the project
+DEBUG = False
 
 
 class RegionExtractor:
@@ -113,7 +123,7 @@ class RegionExtractor:
     def _extract_labels(self):
         labeling_results = self._renderer.takeLabelingResults()
         if labeling_results:
-            self._labels = create_label_layer(labeling_results.allLabels())
+            self._labels = create_label_layer(labeling_results.allLabels(), self.extent)
 
     def save_image(self, output_file, format="jpg", geo=True):
         of = force_format(output_file, format)
@@ -195,17 +205,7 @@ class RegionExtractor:
             )
 
 
-def force_format(file, format):
-    """Force file to be <file>.<format>, whatever the extension of file.
-    Any existing extension will be replaced by format."""
-    if "." in file:
-        file, _ = file.rsplit(".", 1)
-    file = f"{file}.{format}"
-
-    return file
-
-
-def create_label_layer(labels: list[QgsLabelPosition]):
+def create_label_layer(labels: list[QgsLabelPosition], region: QgsRectangle):
     """Create a memory layer with the extracted labels."""
 
     layer_oob = QgsVectorLayer("Polygon?crs=epsg:2154", "oobs", "memory")
@@ -219,6 +219,7 @@ def create_label_layer(labels: list[QgsLabelPosition]):
             QgsField("group_key", QVariant.String),
             QgsField("label", QVariant.String),
             QgsField("feature_label", QVariant.String),
+            QgsField("layer", QVariant.String),
         ]
     )
     layer_oob.updateFields()
@@ -253,6 +254,8 @@ def create_label_layer(labels: list[QgsLabelPosition]):
                     f"{label.featureId}-{group_id}",
                     label.labelText[char_id] if is_curved else label.labelText,
                     label.labelText,
+                    # Get the layer name from the label.layerID
+                    get_layer_name(label.layerID),
                 ]
             )
             features.append(feature)
@@ -274,18 +277,44 @@ def create_label_layer(labels: list[QgsLabelPosition]):
                 SELECT  id,
                 ST_OrientedEnvelope(ST_BUFFER(ST_Union(geometry), 0)) as geometry,
                 STRING_AGG(label, '') AS texte,
-                feature_label AS texte_complet
+                feature_label AS texte_complet,
+                layer AS nature
                 FROM oobs
                 GROUP BY group_key
             """,
             "OUTPUT": "TEMPORARY_OUTPUT",
         },
     )
+    labels_obbs = labels_obbs["OUTPUT"]
 
-    # Drop the temporary OOB layer so it doesn't clutter the project
-    QgsProject.instance().removeMapLayer(layer_oob)
+    if CLIP_OOB_TO_REGION:
+        labels_obbs = processing.run(
+            "native:extractbyextent",
+            {
+                "INPUT": labels_obbs,
+                "EXTENT": region,
+                "CLIP": True,
+                "OUTPUT": "TEMPORARY_OUTPUT",
+            },
+        )
+        labels_obbs = labels_obbs["OUTPUT"]
+        # native:extractbyextent returns multi-part geometries to handle spcial cases
+        # where the OOBs are cut in several parts by the region extent
+        # We absolutely don't want that, so we force the geometries to be single part
+        labels_obbs = processing.run(
+            "native:multiparttosingleparts",
+            {
+                "INPUT": labels_obbs,
+                "OUTPUT": "TEMPORARY_OUTPUT",
+            },
+        )
+        labels_obbs = labels_obbs["OUTPUT"]
 
-    return labels_obbs["OUTPUT"]
+    if not DEBUG:
+        # Drop the temporary OOB layer so it doesn't clutter the project
+        QgsProject.instance().removeMapLayer(layer_oob)
+
+    return labels_obbs
 
 
 def make_wld(image_dims: QSize, world_dims: QgsRectangle):
@@ -316,6 +345,31 @@ def make_wld(image_dims: QSize, world_dims: QgsRectangle):
 
     return wld_str
 
+
+# Utility functions
+
+
+@lru_cache(maxsize=128)  # Adjust maxsize as needed
+def get_layer_name(layer_id):
+    """Retrieve the name of the layer by its ID, with caching."""
+    layer = QgsProject.instance().mapLayer(layer_id)
+    if layer:
+        return layer.name()
+    else:
+        raise ValueError(f"Layer with ID {layer_id} not found.")
+
+
+def force_format(file, format):
+    """Force file to be <file>.<format>, whatever the extension of file.
+    Any existing extension will be replaced by format."""
+    if "." in file:
+        file, _ = file.rsplit(".", 1)
+    file = f"{file}.{format}"
+
+    return file
+
+
+# --- Main script ---
 
 # if __name__ == "__console__":
 """Run the region extraction process when this script is executed in the QGIS Python console."""
