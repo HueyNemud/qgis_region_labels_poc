@@ -48,6 +48,7 @@ from qgis.core import (
     QgsField,
     QgsFeature,
     QgsMapSettings,
+    edit,
 )
 from qgis.utils import iface
 import processing  # type: ignore -> automatically imported by QGIS, but prevent "undefined name" errors in the IDE.
@@ -124,8 +125,7 @@ class RegionExtractor:
             with open(wldfile, "w") as f:
                 f.write(wld)
 
-    def save_labels(self, output_file, format="gpkg"):
-
+    def save_labels_geo(self, output_file, format="gpkg"):
         of = force_format(output_file, format)
         if self._labels:
             processing.run(
@@ -133,6 +133,64 @@ class RegionExtractor:
                 {
                     "INPUT": self._labels,
                     "OUTPUT": of,
+                },
+            )
+
+    def export_for_pipeline(self, output_file, format="csv"):
+        """Export the labels in image space to a CSV file with the 4 corners of the bounding box as WKT POINTs.
+        This export is intended to produce the output for the next step in the pipeline
+        """
+
+        # Use native:affinetransform for this
+        if self._labels:
+            imsize = self._renderer.renderedImage().size()
+
+            # Apply an affine transformation to the labels to convert them from geo coordinates to image (pixel) coordinates
+            scale_x = imsize.width() / self.extent.width()
+            scale_y = -imsize.height() / self.extent.height()
+            delta_x = -self.extent.xMinimum() * scale_x
+            delta_y = -((self.extent.yMinimum() + self.extent.height()) * scale_y)
+
+            labels_imspace = processing.run(
+                "native:affinetransform",
+                {
+                    "INPUT": self._labels,
+                    "OUTPUT": "TEMPORARY_OUTPUT",
+                    "SCALE_X": scale_x,
+                    "SCALE_Y": scale_y,
+                    "DELTA_X": delta_x,
+                    "DELTA_Y": delta_y,
+                },
+            )
+            labels_imspace = labels_imspace["OUTPUT"]
+
+            # Add the 4 corners of the bounding box as WKT POINTs, each in a separate column
+            # Add the columns to the layer
+            labels_imspace.dataProvider().addAttributes(
+                [
+                    QgsField("x1_y1", QVariant.String),
+                    QgsField("x2_y2", QVariant.String),
+                    QgsField("x3_y3", QVariant.String),
+                    QgsField("x4_y4", QVariant.String),
+                ]
+            )
+            labels_imspace.updateFields()
+
+            # Do do so iterate over the features and add the 4 points as WKT POINTs
+            with edit(labels_imspace):
+                for feature in labels_imspace.getFeatures():
+                    geom = feature.geometry()
+                    points = geom.asPolygon()[0]
+                    for i, point in enumerate(points[:4]):
+                        feature[f"x{i+1}_y{i+1}"] = f"POINT({point.x()} {point.y()})"
+                    labels_imspace.updateFeature(feature)
+
+            # Save the layer to a CSV file using processing
+            processing.run(
+                "native:savefeatures",
+                {
+                    "INPUT": labels_imspace,
+                    "OUTPUT": force_format(output_file, format),
                 },
             )
 
@@ -154,6 +212,7 @@ def create_label_layer(labels: list[QgsLabelPosition]):
     provider = layer_oob.dataProvider()
     provider.addAttributes(
         [
+            QgsField("id", QVariant.Int),
             QgsField("feature_id", QVariant.Int),
             QgsField("group_id", QVariant.Int),
             QgsField("element_id", QVariant.Int),
@@ -170,7 +229,7 @@ def create_label_layer(labels: list[QgsLabelPosition]):
 
     features = []
 
-    for label in labels:
+    for id, label in enumerate(labels):
         if prev is None:
             prev = label
 
@@ -187,6 +246,7 @@ def create_label_layer(labels: list[QgsLabelPosition]):
             feature.setGeometry(oob)
             feature.setAttributes(
                 [
+                    id,
                     label.featureId,
                     group_id,
                     char_id,
@@ -211,10 +271,10 @@ def create_label_layer(labels: list[QgsLabelPosition]):
         {
             "INPUT_DATASOURCES": [layer_oob],
             "INPUT_QUERY": """
-                SELECT group_id,
-                group_key,
+                SELECT  id,
                 ST_OrientedEnvelope(ST_BUFFER(ST_Union(geometry), 0)) as geometry,
-                STRING_AGG(label, '') AS label
+                STRING_AGG(label, '') AS texte,
+                feature_label AS texte_complet
                 FROM oobs
                 GROUP BY group_key
             """,
@@ -280,7 +340,8 @@ for ix, region in enumerate(regions):
     extractor = RegionExtractor(center, width, height)
     extractor.run()
     extractor.save_image(output)
-    extractor.save_labels(output)
+    extractor.save_labels_geo(output)
+    extractor.export_for_pipeline(output)
     end = timer()
     exec_times.append(end - start)
     print(f"#{ix} took {(end - start):.2f} seconds")
