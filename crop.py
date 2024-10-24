@@ -57,6 +57,7 @@ from PyQt5.QtCore import QVariant, QSize
 from timeit import default_timer as timer
 from functools import lru_cache
 
+
 # All blank spaces and breaks are considered word separators.
 WORD_SEPARATORS = [" ", "\t", "\n", "\r", "\f", "\v"]
 
@@ -65,6 +66,9 @@ CLIP_OOB_TO_REGION = True
 
 # In DEBUG mode, the OOBs layer is kept in the project
 DEBUG = False
+
+# Force garbage collection to avoid memory leaks every GC_FREQ iterations
+GC_FREQ = 10
 
 
 class RegionExtractor:
@@ -92,6 +96,7 @@ class RegionExtractor:
     extent: QgsRectangle = None
     _map_settings: QgsMapSettings = None
     _renderer: QgsMapRendererParallelJob = None
+    _layers_garbage_collector = []
 
     def __init__(self, center: tuple[float, float], width: float, height: float):
         x, y = center
@@ -121,7 +126,9 @@ class RegionExtractor:
     def _extract_labels(self):
         labeling_results = self._renderer.takeLabelingResults()
         if labeling_results:
-            self._labels = create_label_layer(labeling_results.allLabels(), self.extent)
+            self._labels = self._create_label_layer(
+                labeling_results.allLabels(), self.extent
+            )
 
     def save_image(self, output_file, format="jpg", geo=True):
         of = force_format(output_file, format)
@@ -171,6 +178,7 @@ class RegionExtractor:
                 },
             )
             labels_imspace = labels_imspace["OUTPUT"]
+            self._layers_garbage_collector.append(labels_imspace)
 
             # Save the layer to a CSV file using processing
             processing.run(
@@ -182,139 +190,156 @@ class RegionExtractor:
                 },
             )
 
+    def _create_label_layer(self, labels: list[QgsLabelPosition], region: QgsRectangle):
+        """Create a memory layer with the extracted labels."""
 
-def create_label_layer(labels: list[QgsLabelPosition], region: QgsRectangle):
-    """Create a memory layer with the extracted labels."""
-
-    layer_oob = QgsVectorLayer("Polygon?crs=epsg:2154", "oobs", "memory")
-    provider = layer_oob.dataProvider()
-    provider.addAttributes(
-        [
-            QgsField("id", QVariant.Int),
-            QgsField("feature_id", QVariant.Int),
-            QgsField("group_id", QVariant.Int),
-            QgsField("element_id", QVariant.Int),
-            QgsField("group_key", QVariant.String),
-            QgsField("label", QVariant.String),
-            QgsField("feature_label", QVariant.String),
-            QgsField("layer", QVariant.String),
-        ]
-    )
-    layer_oob.updateFields()
-
-    prev = None
-    char_id: int = 0
-    group_id = 0
-
-    features = []
-
-    for id, label in enumerate(labels):
-        if prev is None:
-            prev = label
-
-        if prev.labelText != label.labelText or label.featureId != prev.featureId:
-            char_id = 0
-            prev = label
-
-        if label.labelText[char_id] in WORD_SEPARATORS:
-            group_id += 1
-        else:
-            is_curved = label.groupedLabelId != 0  # Non zero if in a curved label.
-            oob = label.labelGeometry
-            feature = QgsFeature()
-            feature.setGeometry(oob)
-            feature.setAttributes(
-                [
-                    id,
-                    label.featureId,
-                    group_id,
-                    char_id,
-                    f"{label.featureId}-{group_id}",
-                    label.labelText[char_id] if is_curved else label.labelText,
-                    label.labelText,
-                    # Get the layer name from the label.layerID
-                    get_layer_name(label.layerID),
-                ]
-            )
-            features.append(feature)
-
-        char_id += 1
-
-    # If there are no labels, create an empty layer and return it
-    if not features:
-        m = f"No labels in {region.asWktPolygon()}"
-        QgsMessageLog.logMessage(m, "LabelExtractor", Qgis.Warning)
-        print(m)
-
-        # For next steps to behave consistently, we create and return an new, empty layer
-        # with the same fields as the output of this function
-        dummy = QgsVectorLayer("Polygon?crs=epsg:2154", "labels_oobs", "memory")
-        dummy.dataProvider().addAttributes(
+        layer_oob = QgsVectorLayer("Polygon?crs=epsg:2154", "oobs", "memory")
+        provider = layer_oob.dataProvider()
+        provider.addAttributes(
             [
                 QgsField("id", QVariant.Int),
-                QgsField("geometry", QVariant.Polygon),
-                QgsField("texte", QVariant.String),
-                QgsField("texte_complet", QVariant.String),
-                QgsField("nature", QVariant.String),
+                QgsField("feature_id", QVariant.Int),
+                QgsField("group_id", QVariant.Int),
+                QgsField("element_id", QVariant.Int),
+                QgsField("group_key", QVariant.String),
+                QgsField("label", QVariant.String),
+                QgsField("feature_label", QVariant.String),
+                QgsField("layer", QVariant.String),
             ]
         )
-        dummy.updateFields()
-        print(f"Created dummy layer for {region.asWktPolygon()}")
-        return dummy
+        layer_oob.updateFields()
 
-    provider.addFeatures(features)
+        prev = None
+        char_id: int = 0
+        group_id = 0
 
-    # Adding the layer to the project is required to run SQL queries on it.
-    QgsProject.instance().addMapLayer(layer_oob)
+        features = []
 
-    # Run an SQL query on the scratch layer layer_oob to merge all polygons
-    #  with the same group_key and concatenate the labels
-    labels_obbs = processing.run(
-        "qgis:executesql",
-        {
-            "INPUT_DATASOURCES": [layer_oob],
-            "INPUT_QUERY": """
-                SELECT  id,
-                ST_OrientedEnvelope(ST_BUFFER(ST_Union(geometry), 0)) as geometry,
-                STRING_AGG(label, '') AS texte,
-                feature_label AS texte_complet,
-                layer AS nature
-                FROM oobs
-                GROUP BY group_key
-            """,
-            "OUTPUT": "TEMPORARY_OUTPUT",
-        },
-    )
-    labels_obbs = labels_obbs["OUTPUT"]
+        for id, label in enumerate(labels):
+            if prev is None:
+                prev = label
 
-    if CLIP_OOB_TO_REGION:
+            if prev.labelText != label.labelText or label.featureId != prev.featureId:
+                char_id = 0
+                prev = label
+
+            if label.labelText[char_id] in WORD_SEPARATORS:
+                group_id += 1
+            else:
+                is_curved = label.groupedLabelId != 0  # Non zero if in a curved label.
+                oob = label.labelGeometry
+                feature = QgsFeature()
+                feature.setGeometry(oob)
+                feature.setAttributes(
+                    [
+                        id,
+                        label.featureId,
+                        group_id,
+                        char_id,
+                        f"{label.featureId}-{group_id}",
+                        label.labelText[char_id] if is_curved else label.labelText,
+                        label.labelText,
+                        # Get the layer name from the label.layerID
+                        get_layer_name(label.layerID),
+                    ]
+                )
+                features.append(feature)
+
+            char_id += 1
+
+        # If there are no labels, create an empty layer and return it
+        if not features:
+            m = f"No labels in {region.asWktPolygon()}"
+            QgsMessageLog.logMessage(m, "LabelExtractor", Qgis.Warning)
+            print(m)
+
+            # For next steps to behave consistently, we create and return an new, empty layer
+            # with the same fields as the output of this function
+            dummy = QgsVectorLayer("Polygon?crs=epsg:2154", "labels_oobs", "memory")
+            dummy.dataProvider().addAttributes(
+                [
+                    QgsField("id", QVariant.Int),
+                    QgsField("geometry", QVariant.Polygon),
+                    QgsField("texte", QVariant.String),
+                    QgsField("texte_complet", QVariant.String),
+                    QgsField("nature", QVariant.String),
+                ]
+            )
+            dummy.updateFields()
+            print(f"Created dummy layer for {region.asWktPolygon()}")
+            self._layers_garbage_collector.append(dummy)
+            return dummy
+
+        provider.addFeatures(features)
+
+        # Adding the layer to the project is required to run SQL queries on it.
+        QgsProject.instance().addMapLayer(layer_oob)
+
+        if not DEBUG:
+            self._layers_garbage_collector.append(layer_oob)
+
+        # Run an SQL query on the scratch layer layer_oob to merge all polygons
+        #  with the same group_key and concatenate the labels
         labels_obbs = processing.run(
-            "native:extractbyextent",
+            "qgis:executesql",
             {
-                "INPUT": labels_obbs,
-                "EXTENT": region,
-                "CLIP": True,
+                "INPUT_DATASOURCES": [layer_oob],
+                "INPUT_QUERY": """
+                    SELECT  id,
+                    ST_OrientedEnvelope(ST_BUFFER(ST_Union(geometry), 0)) as geometry,
+                    STRING_AGG(label, '') AS texte,
+                    feature_label AS texte_complet,
+                    layer AS nature
+                    FROM oobs
+                    GROUP BY group_key
+                """,
                 "OUTPUT": "TEMPORARY_OUTPUT",
             },
         )
         labels_obbs = labels_obbs["OUTPUT"]
-        # native:extractbyextent returns multi-part geometries to handle spcial cases
-        # where the OOBs are cut in several parts by the region extent
-        # We absolutely don't want that, so we force the geometries to be single part
-        labels_obbs = processing.run(
-            "native:multiparttosingleparts",
-            {
-                "INPUT": labels_obbs,
-                "OUTPUT": "TEMPORARY_OUTPUT",
-            },
-        )
-        labels_obbs = labels_obbs["OUTPUT"]
+        self._layers_garbage_collector.append(labels_obbs)
 
-    if not DEBUG:
-        # Drop the temporary OOB layer so it doesn't clutter the project
-        QgsProject.instance().removeMapLayer(layer_oob)
+        if CLIP_OOB_TO_REGION:
+            clipped = processing.run(
+                "native:extractbyextent",
+                {
+                    "INPUT": labels_obbs,
+                    "EXTENT": region,
+                    "CLIP": True,
+                    "OUTPUT": "TEMPORARY_OUTPUT",
+                },
+            )
+            clipped = clipped["OUTPUT"]
+            self._layers_garbage_collector.append(clipped)
 
-    return labels_obbs
+            # native:extractbyextent returns multi-part geometries to handle spcial cases
+            # where the OOBs are cut in several parts by the region extent
+            # We absolutely don't want that, so we force the geometries to be single part
+            singleparts = processing.run(
+                "native:multiparttosingleparts",
+                {
+                    "INPUT": clipped,
+                    "OUTPUT": "TEMPORARY_OUTPUT",
+                },
+            )
+            singleparts = singleparts["OUTPUT"]
+            self._layers_garbage_collector.append(singleparts)
+
+            labels_obbs = singleparts
+
+        return labels_obbs
+
+    def __del__(self):
+        print("Cleaning up", len(self._layers_garbage_collector))
+        for layer in self._layers_garbage_collector:
+            try:
+                QgsProject.instance().removeMapLayer(layer)
+                layer.deleteLater()
+            except RuntimeError:
+                pass  # C++ object already deleted
+
+        self._layers_garbage_collector.clear()
+        self._renderer.deleteLater()
 
 
 def make_wld(image_dims: QSize, world_dims: QgsRectangle):
@@ -399,6 +424,7 @@ for ix, region in enumerate(regions):
     end = timer()
     exec_times.append(end - start)
     print(f"#{ix} took {(end - start):.2f} seconds")
+
 
 print(f"Extracted {len(exec_times)} regions")
 print(
